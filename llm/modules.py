@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import Tuple
 
 
 class RMSNorm(nn.Module):
@@ -14,14 +15,14 @@ class RMSNorm(nn.Module):
 
     Returns: 
         torch.Tensor: Normalized batch of token embeddings 
-            with size [batch_size, seq_len, emb_dim].
+            with size [batch_size (B), seq_len (L), emb_dim (D)].
     """
     def __init__(
             self, 
             emb_dim: int, 
             eps: float = 1e-6,
             bias: bool = False
-            ) -> None:
+    ) -> None:
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(emb_dim))
@@ -36,3 +37,187 @@ class RMSNorm(nn.Module):
         
         return norm_x
     
+class GroupedQueryAttention(nn.Module):
+    """
+    GroupedQueryAttention (GQA) layer, which shares key and value matricies
+    among heads of groups to reduce computation costs related to MHSA.
+    Each head has unique query matrix. For key and value matricies head are divided
+    to several groups, head in each group share same key and value matricies.
+
+    Args:
+        dim_in (int): Embedding dimension.
+        num_heads (int): Total number of heads.
+        head_dim (int): Dimension of query, key and value vectors.
+        num_kv_groups (int): Number of groups of heads, which defines
+            total number of key and value matricies used in GQA.
+        qk_norm (bool): Defines if RMSNorm is applied to head_dim of 
+            key and value matricies.
+    Returns:
+        torch.Tensor:  Batch of representations of tokens in a sequence. 
+            Equal to dim_in to ensure residual connection.
+    """
+    def __init__(
+            self,
+            dim_in: int,
+            num_heads: int,
+            num_kv_groups: int,
+            head_dim: int = None,
+            qk_norm: bool = False
+    ) -> None:
+        super().__init__()
+        if num_heads % num_kv_groups != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must be divisible by num_kv_groups ({num_kv_groups})."
+            )
+        self.num_heads = num_heads
+        self.num_kv_groups = num_kv_groups
+        self.group_size = num_heads // num_kv_groups
+
+        if head_dim is None:
+            if dim_in % num_heads != 0:
+                raise ValueError(
+                    f"If head_dim is not set, dim_in ({dim_in}) must be divisible by "
+                    f"num_heads ({num_heads}) to ensure dim_out == dim_in. "
+                )
+            head_dim = dim_in // num_heads
+        self.head_dim = head_dim
+        self.dim_out = num_heads * head_dim
+        self.dim_in = dim_in
+
+        self.W_query = nn.Linear(dim_in, self.dim_out, bias=False)  # [B, L, D] -> [B, L, h_D, N_h]
+        self.W_key = nn.Linear(dim_in, head_dim * num_kv_groups, bias=False)  # [B, L, D] -> [B, L, h_D, N_g]
+        self.W_value = nn.Linear(dim_in, head_dim * num_kv_groups, bias=False)  # [B, L, D] -> [B, L, h_D, N_g]
+        self.out_proj = nn.Linear(self.dim_out, dim_in, bias=False)
+
+        if qk_norm:
+            self.q_norm = RMSNorm(head_dim, eps=1e-6)
+            self.k_norm = RMSNorm(head_dim, eps=1e-6)
+        else:
+            self.q_norm = self.k_norm = None
+
+    def forward(
+            self, 
+            x: torch.Tensor, 
+            mask: torch.Tensor, 
+            cos: torch.Tensor,
+            sin: torch.Tensor, 
+            start_pos: int = 0,
+            kv_cache: Tuple[torch.Tensor, torch.Tensor] = None
+    ) -> torch.Tensor:
+        batch_size, num_tokens, _ = x.shape
+
+        # Get Q, K, V matricies
+        queries = self.W_query(x)  # [batch_size, num_tokens, num_heads * head_dim]
+        keys = self.W_key(x)  # [batch_size, num_tokens, num_kv_groups * head_dim]
+        values = self.W_value(x)  # [batch_size, num_tokens, num_kv_groups * head_dim]
+
+        queries = queries.view(
+            batch_size, num_tokens, self.num_heads, self.head_dim
+        ).transpose(1, 2)  # [batch_size, num_heads, num_tokens, head_dim]
+        new_keys = keys.view(
+            batch_size, num_tokens, self.num_kv_groups, self.head_dim
+        ).transpose(1, 2)  # [batch_size, num_kv_groups, num_tokens, head_dim]
+        new_values = values.view(
+            batch_size, num_tokens, self.num_kv_groups, self.head_dim
+        ).transpose(1, 2)  # [batch_size, num_kv_groups, num_tokens, head_dim]
+
+        # Optional Q/K RMSNorm used in Qwen3
+        if self.q_norm:
+            queries = self.q_norm(queries)
+        if self.k_norm:
+            new_keys = self.k_norm(new_keys)
+
+        queries = GroupedQueryAttention.apply_rope(queries, cos, sin, offset=start_pos)
+        new_keys = GroupedQueryAttention.apply_rope(new_keys, cos, sin, offset=start_pos)
+
+
+
+        return x
+    
+    # TODO Move to llm/llm.py
+    # Use https://nn.labml.ai/transformers/rope/index.html as a reference to understand details
+    @staticmethod
+    def compute_rope_params(
+        head_dim: int,
+        theta_base: int = 10_000,
+        context_length: int = 4096
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Precomputes sine and cosine tables for each token position and 
+        each i in [1, 2, ..., head_dim / 2]. Parameter i is a coordinate of 
+        embedding inside attention layer.
+
+        Args:
+            head_dim (int): Embeddings dimension inside attention layer.
+            theta_base (int): Base used to calculate theta_i's used in RoPE's rotation matrix.
+                Note: theta_base ^ {-2 * (i - 1) / head_dim} for i in [1, 2, ..., head_dim / 2]
+            context_length (int): Context window of a model, i.e., how much tokens can be processed at once.
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Final tables of sines and cosines. 
+
+        Notes: 
+            m's rows in sine and cosine tables are calculated with the following arguments:
+                [m*theta_0, m*theta_1, ..., m*theta_{head_dim/2}, m*theta_0, m*theta_1, ..., m*theta_{head_dim/2}]
+            Check this explanation for further explanations: 
+                https://nn.labml.ai/transformers/rope/index.html
+        """
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"Head dimension must be even, but you have head_dim = {head_dim}"
+            )
+        # theta_i angles, for i in [1, 2, ..., head_dim / 2]. theta_i = 10000^(-2 * (i-1) / d)
+        theta = 1. / theta_base ** (torch.arange(0, head_dim // 2, 2) / head_dim)
+        positions = torch.arange(context_length)  # Token positions
+        angles = positions.unsqueeze(1) * theta.unsqueeze(0)  # [context_length, head_dim // 2]
+        # Total table of angles
+        angles = torch.cat([angles, angles], dim=1)  # [context_length, head_dim]
+
+        # Compute sines and cosines tables for further final calculations of RoPE
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        return cos, sin
+
+    @staticmethod
+    def apply_rope(
+            x: torch.Tensor, 
+            cos: torch.Tensor, 
+            sin: torch.Tensor, 
+            offset: int = 0
+    ) -> torch.Tensor:
+        """
+        Applies RoPE to x in attention layer.
+
+        Args:
+            x (torch.Tensor): Tensor of token embeddings inside attention.
+                Has shape [batch_size, num_heads, seq_length, head_dim].
+            cos (torch.Tensor): Precomputed table of cosines with argument m * theta_i 
+                for each m (token position) in context window and each i (embedding coordinate).
+                Has shape [context_length, head_dim].
+            sin (torch.Tensor): Precomputed table of sines with argument m * theta_i 
+                for each m (token position) in context window and each i (embedding coordinate).
+                Has shape [context_length, head_dim].
+            offset (int): Current position (current token) in context.
+        Returns:
+            torch.Tensor: Initial x tensor with applied RoPE to it's tokens.
+                Has same shape as x.
+        
+        Notes:
+            rotated_x in final has the following look:
+                [-x_{head_dim/2 + 1}, ..., -x_{head_dim}, x_1, ..., x_{head_dim/2}]
+            Check this explanation for further explanations: 
+                https://nn.labml.ai/transformers/rope/index.html
+        """
+        batch_size, num_heads, seq_len, head_dim = x.shape  # seq_len = context_length
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"Head dimension must be even, but you have head_dim = {head_dim}"
+            )
+        x1 = x[..., : head_dim // 2]  # First half of embeddings
+        x2 = x[..., head_dim // 2 :]  # Second half of emdeddings
+
+        cos = cos[offset:offset + seq_len, :].unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim]
+        sin = sin[offset:offset + seq_len, :].unsqueeze(0).unsqueeze(0)
+
+        rotated_x = torch.cat([-x2, x1], dim=-1)  # x rotated by 90 degree
+        roped_x = (x * cos) + (rotated_x * sin)
+        return roped_x
