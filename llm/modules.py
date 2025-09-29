@@ -303,11 +303,6 @@ class MultiQueryAttention(GroupedQueryAttention):
             head_dim=head_dim, 
             qk_norm=qk_norm
         )
-class GatedAttention():
-    pass
-
-class GatedDeltaNet():
-    pass
 
 class FeedForwardNet(nn.Module):
     """
