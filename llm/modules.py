@@ -353,4 +353,56 @@ class FeedForwardNet(nn.Module):
         x2 = self.fc2(x)
         x = self.act_fn(x1) * x2
         return self.fc_out(x)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        match config.attention_type:
+            case "MHSA":
+                self.attn = MultiHeadSelfAttention(**config.attention)
+            case "GQA":
+                self.attn = GroupedQueryAttention(**config.attention)
+            case "MQA":
+                self.attn = MultiQueryAttention(**config.attention)
+            case _:
+                raise ValueError(
+                    f"Unsupported attention type: {config.attention_type}. "
+                    f"Please, choose between 'MHSA', 'GQA' and 'MQA'."
+                )
+        
+        match config.ffn_type:
+            case "Dense":
+                self.ffn = FeedForwardNet(**config.ffn)
+            case _:
+                raise ValueError(f"Unsupported FFN type: {config.ffn_type}.")
+        self.norm1 = RMSNorm(
+            emb_dim=config.norm["embedding_dim"], 
+            eps=config.norm["epsilon"],
+            bias=config.norm["bias"]
+        )
+        self.norm2 = RMSNorm(
+            emb_dim=config.norm["embedding_dim"],
+            eps=config.norm["eps"],
+            bias=config.norm["bias"]
+        )
+    
+    def forward(
+            self,
+            x: torch.Tensor,
+            mask: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            start_pos: int = 0,
+            kv_cache: Tuple[torch.Tensor, torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        residual = x
+        x = self.norm1(x)
+        x, next_cache = self.attn(x, mask, cos, sin, start_pos=start_pos, kv_cache=kv_cache)
+        x = x + residual
+
+        residual = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = x + residual
+        return x, next_cache
     
