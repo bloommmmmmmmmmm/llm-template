@@ -39,7 +39,7 @@ class RMSNorm(nn.Module):
     
 class GroupedQueryAttention(nn.Module):
     """
-    GroupedQueryAttention (GQA) layer, which shares key and value matricies
+    Grouped-Query Attention (GQA) layer, which shares key and value matricies
     among heads of groups to reduce computation costs related to MHSA.
     Each head has unique query matrix. For key and value matricies head are divided
     to several groups, head in each group share same key and value matricies.
@@ -205,7 +205,7 @@ class GroupedQueryAttention(nn.Module):
             offset: int = 0
     ) -> torch.Tensor:
         """
-        Applies RoPE to x in attention layer.
+        Applies RoPE (Rotary Positional Encoding) to x in attention layer.
 
         Args:
             x (torch.Tensor): Tensor of token embeddings inside attention.
@@ -241,3 +241,64 @@ class GroupedQueryAttention(nn.Module):
         rotated_x = torch.cat([-x2, x1], dim=-1)  # x rotated by 90 degree
         roped_x = (x * cos) + (rotated_x * sin)
         return roped_x
+    
+class MultiHeadSelfAttention(GroupedQueryAttention):
+    """
+    Implementation of Multi-Head Self-Attention (MHSA) as a 
+    special case of Grouped-Query Attention.
+    Each head has unique keys and values matricies. num_kv_groups = num_heads
+
+    Args:
+        dim_in (int): Embedding dimension.
+        num_heads (int): Total number of heads.
+        head_dim (int): Dimension of query, key and value vectors.
+        qk_norm (bool): Defines if RMSNorm is applied to head_dim of 
+            key and value matricies.
+    Returns:
+        torch.Tensor:  Batch of representations of tokens in a sequence. 
+            Equal to dim_in to ensure residual connection.
+    """
+    def __init__(
+            self, 
+            dim_in: int, 
+            num_heads: int,
+            head_dim: int = None, 
+            qk_norm: bool = False
+    ) -> None:
+        super().__init__(
+            dim_in=dim_in, 
+            num_heads=num_heads, 
+            num_kv_groups=num_heads
+            head_dim=head_dim, 
+            qk_norm=qk_norm,
+        )
+
+class MultiQueryAttention(GroupedQueryAttention):
+    """
+    Implementation of Multi-Query Attention (MQA) as a 
+    special case of Grouped-Query Attention.
+    Every head shares same keys and values matricies. num_kv_groups = 1
+
+    Args:
+        dim_in (int): Embedding dimension.
+        num_heads (int): Total number of heads.
+        head_dim (int): Dimension of query, key and value vectors.
+        qk_norm (bool): Defines if RMSNorm is applied to head_dim of 
+            key and value matricies.
+    Returns:
+        torch.Tensor:  Batch of representations of tokens in a sequence. 
+            Equal to dim_in to ensure residual connection.
+    """
+    def __init__(
+            self, 
+            dim_in: int, 
+            num_heads: int, 
+            head_dim: int = None, 
+            qk_norm: bool = False
+        ) -> None:
+        super().__init__(
+            dim_in=dim_in, 
+            num_heads=num_heads, 
+            num_kv_groups=1, 
+            head_dim=head_dim, 
+            qk_norm=qk_norm)
