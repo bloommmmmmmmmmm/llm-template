@@ -268,9 +268,9 @@ class MultiHeadSelfAttention(GroupedQueryAttention):
         super().__init__(
             dim_in=dim_in, 
             num_heads=num_heads, 
-            num_kv_groups=num_heads
+            num_kv_groups=num_heads,
             head_dim=head_dim, 
-            qk_norm=qk_norm,
+            qk_norm=qk_norm
         )
 
 class MultiQueryAttention(GroupedQueryAttention):
@@ -301,4 +301,56 @@ class MultiQueryAttention(GroupedQueryAttention):
             num_heads=num_heads, 
             num_kv_groups=1, 
             head_dim=head_dim, 
-            qk_norm=qk_norm)
+            qk_norm=qk_norm
+        )
+class GatedAttention():
+    pass
+
+class GatedDeltaNet():
+    pass
+
+class FeedForwardNet(nn.Module):
+    """
+    Feed-Forward Network (FFN) after attention layer in Transformer block.
+
+    Args:
+        dim_in (int): Embedding dimension.
+        hidden_dim (int): Dimension of hidden layers (number of neurons in a layer).
+        activation_fn (str): Activation function used as a non-linearity.
+    Returns:
+        torch.Tensor: Final tokens representation tensor of Transformer block.
+            (Note: before adding residual)
+    """
+    def __init__(
+            self,
+            dim_in: int,
+            hidden_dim: int,
+            activation_fn: str = "silu"
+    ) -> None:
+        super().__init__()
+        self.dim_in = dim_in
+        self.hidden_dim = hidden_dim
+        self.dim_out = dim_in
+        self.activation_fn = activation_fn
+
+        self.fc1 = nn.Linear(dim_in, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(dim_in, hidden_dim, bias=False)
+        self.fc_out = nn.Linear(hidden_dim, dim_out, bias=False)
+        
+        match activation_fn:
+            case "silu":
+                self.act_fn = nn.SiLU()
+            case "gelu":
+                self.act_fn = nn.GELU()
+            case _:
+                raise ValueError(
+                    f"Unsupported activation function: {activation_fn}. "
+                    f"Please, choose between 'silu' and 'gelu'."
+                )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.fc1(x)
+        x2 = self.fc2(x)
+        x = self.act_fn(x1) * x2
+        return self.fc_out(x)
+    
