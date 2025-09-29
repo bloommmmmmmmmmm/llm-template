@@ -114,10 +114,10 @@ class GroupedQueryAttention(nn.Module):
         queries = queries.view(
             batch_size, num_tokens, self.num_heads, self.head_dim
         ).transpose(1, 2)  # [batch_size, num_heads, num_tokens, head_dim]
-        new_keys = keys.view(
+        keys_new = keys.view(
             batch_size, num_tokens, self.num_kv_groups, self.head_dim
         ).transpose(1, 2)  # [batch_size, num_kv_groups, num_tokens, head_dim]
-        new_values = values.view(
+        values_new = values.view(
             batch_size, num_tokens, self.num_kv_groups, self.head_dim
         ).transpose(1, 2)  # [batch_size, num_kv_groups, num_tokens, head_dim]
 
@@ -125,14 +125,34 @@ class GroupedQueryAttention(nn.Module):
         if self.q_norm:
             queries = self.q_norm(queries)
         if self.k_norm:
-            new_keys = self.k_norm(new_keys)
+            keys_new = self.k_norm(keys_new)
 
+        # Apply RoPE
         queries = GroupedQueryAttention.apply_rope(queries, cos, sin, offset=start_pos)
-        new_keys = GroupedQueryAttention.apply_rope(new_keys, cos, sin, offset=start_pos)
+        keys_new = GroupedQueryAttention.apply_rope(keys_new, cos, sin, offset=start_pos)
 
+        if kv_cache:  # If kv_cache is not empty and stores previously calculated keys and values
+            cached_k, cached_v = kv_cache
+            keys = torch.cat([cached_k, keys_new], dim=2)  # num_tokens dim
+            values = torch.cat([cached_v, values_new], dim=2)
+            next_kv_cache = (keys, values)
+        else:  # If kv_cache is empty -> No words have been generated
+            start_pos = 0  # Reset RoPE
+            keys, values = keys_new, values_new
+            next_kv_cache = (keys, values)
 
+        # Exopand keys and values matricies to match queries matrix's num_heads
+        keys = keys.repeat_interleave(self.group_size, dim=1)  # num_kv_groups dim
+        values = values.repeat_interleave(self.group_size, dim=1)
 
-        return x
+        attn_scores = queries @ keys.transpose(2, 3)  # [B, N_h, L, L]
+        # Apply triangluar mask to obscure future tokens
+        attn_scores = attn_scores.masked_fill_(mask=mask, value=-torch.inf)
+        attn_weights = nn.functional.softmax(attn_scores / self.head_dim ** 2, dim=-1)
+        #  [B, N_h, L, D] -> [B, L, N_h, D] -> [B, L, N_h * D]
+        #  N_h * D stands for concatenation from all heads
+        output = (attn_weights @ values).transpose(1, 2).reshape(batch_size, num_tokens, self.dim_out)
+        return self.out_proj(output), next_kv_cache
     
     # TODO Move to llm/llm.py
     # Use https://nn.labml.ai/transformers/rope/index.html as a reference to understand details
